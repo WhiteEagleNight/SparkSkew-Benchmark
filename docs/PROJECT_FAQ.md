@@ -64,7 +64,7 @@ DWS 构建完成后执行两条强校验：
 *   `all`：所有 item 都加盐，用来测“全量加盐”的上界成本；
 *   `hot_only`：只给指定的 `hot_item_id` 加盐，其余 item 的 `_salt=0`。这是实际生产中更常见的“选择性加盐”做法，避免为了一个热 key 把 2 万个普通 item 都拆开。
 
-注意：加盐方案必须多一次 shuffle（stage-1 按 `(item_id, _salt)`，stage-2 才恢复 `item_id`）；不加盐的两次同 key `groupBy` 可能被 Catalyst 合并成一次 shuffle。因此 benchmark 比较的是“加盐这套做法 vs 不加盐”，并明确报告额外 shuffle，而不是声称物理计划只差一个布尔位。
+注意：加盐方案在本写法下会多一次 shuffle（stage-1 按 `(item_id, _salt)`，stage-2 才恢复 `item_id`，通常无法享受同 key 两阶段聚合的合并）；不加盐的两次同 key `groupBy` 可能被 Catalyst 合并成一次 shuffle。因此 benchmark 比较的是“加盐这套做法 vs 不加盐”，并明确报告额外 shuffle，而不是声称物理计划只差一个布尔位。
 
 ### 3.3 确定性盐值生成策略
 盐值计算采用 `pmod(xxhash64(user_id, behavior_type, event_time), N)`。
@@ -86,9 +86,11 @@ DWS 构建完成后执行两条强校验：
 | 全量加盐 | 3.408s | 846ms | 18.418MB | 190,924 |
 | 仅热点键加盐 | 2.806s | 552ms | 11.522MB | 20,009 |
 
-**结论**：在当前 `count/sum` 负载下（支持 map 端 Combine），两种加盐方式都产生了负优化。不加盐时，100 万行数据在 map 端已被 Combine 压缩至约 44 万条 Shuffle 记录，reduce 端未出现长尾；全量加盐把 stage-1 的 group 数扩大到实测 190,924，并额外引入一次 Shuffle，导致整体性能下降。仅热点键加盐只把 item 9999 拆成 10 个桶，stage-1 group 数为 20,009、shuffle write 为 440,708 条，额外开销明显变小，wall clock 变化从全量加盐的 +44.77% 降到 +19.20%，但因为仍多一次 shuffle，没有转为收益。该负结果已如实记录于工程文档中。
+**结论（仅限本实验条件）**：在上述 1M 行、`local[8]`、16 分区、AQE off 的 `count/sum` 负载下（支持 map 端 Combine），本实现里的两种加盐方式都产生了负优化。不加盐时，100 万行数据在 map 端已被 Combine 压缩至约 44 万条 Shuffle 记录，reduce 端未出现长尾；全量加盐把 stage-1 的 group 数扩大到实测 190,924，并额外引入一次 Shuffle，导致整体性能下降。仅热点键加盐只把 item 9999 拆成 10 个桶，stage-1 group 数为 20,009、shuffle write 为 440,708 条，额外开销明显变小，wall clock 变化从全量加盐的 +44.77% 降到 +19.20%，但因为在本写法下仍多一次 shuffle，没有转为收益。该负结果已如实记录于工程文档中；它不能外推到生产规模或开启 AQE 的环境。
 
 桶数 sweep 进一步显示：2 / 5 / 20 桶下，全量加盐 wall clock 变化为 +14.25% / +37.14% / +34.79%，仅热点键加盐为 +11.26% / +15.49% / +8.81%。每个桶的 baseline 都是桶内独立重跑，但本轮单次 sweep 未观察到“桶数越多越快”的单调关系；跨桶百分比差异仍混有 baseline 漂移（2.033s–2.211s）和单次运行噪声，不能全部归因于桶数。
+
+本实验最长 Task 只有 456ms，长尾并不严重；“仅热点键加盐仍为负”只适用于这份实现和负载；Join 倾斜或 groupByKey 长尾、单 Task 达到数千万行时，加盐仍可能有效，但必须实测净收益。
 
 ### 3.6 加盐技术的适用边界
 

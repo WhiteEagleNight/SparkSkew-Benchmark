@@ -30,14 +30,17 @@
 4. **结构分离的可视化看板**：Dashboard 与计算逻辑完全解耦，仅通过读取离线产出的
    JSON 文件进行展示，避免在页面内进行实时重计算。
 
-> 本项目的 benchmark 是**负结果**：在这份可 map-side combine 的 `count/sum`
-> 负载上，强行加盐反而更慢。这里保留了真实数据和原因分析。
+> 本项目的 benchmark 是一个**条件性负结果**：在 Windows 11、`local[8]`、
+> 16 个 shuffle partition、关闭 AQE、100 万行、38.04% 热 key 的
+> `count/sum`（可 map-side combine）负载上，本实现里的加盐方案比不加盐慢。
+> 这里保留真实数据和原因分析；这个结果不能外推到生产规模、其他数据分布，
+> 也不能外推到开启 AQE 的环境——生产 Spark 3.x 通常默认开启 AQE，净收益可能不同。
 > 因此 DWS 默认走**不加盐**路径；加盐路径保留为 `--salted` 的演示/回归入口，
 > 不作为本负载的生产默认。两者产出同一张 DWS，并接受相同的对账断言。
 >
 > 本项目还对比了**仅热点键加盐**：只给 item `9999` 分桶，其余 item 保持
 > `_salt=0`。它把 stage-1 实际 group 数从全量加盐的 190,924 压回 20,009，
-> 额外 Shuffle 明显变小；但在这个可 Combine 的聚合上仍然没有正收益。
+> 额外 Shuffle 明显变小；但在本实验这份可 Combine 的聚合上仍然没有正收益。
 
 ---
 
@@ -88,7 +91,7 @@ flowchart LR
 | 热门商品占比 | **38.04%** |
 | 冷启动（仅测试期出现）用户 | 5,000 / 45,054 = **11.0978%** |
 
-### Shuffle benchmark（1M 行，第二次运行）
+### Shuffle benchmark（1M 行，第二次运行，单样本）
 
 | 方案（10 桶） | Wall clock | 最长 Task | Shuffle read/write | Stage-1 实际 group 数 |
 |---|---:|---:|---:|---:|
@@ -99,7 +102,8 @@ flowchart LR
 | 仅热点键加盐 vs 不加盐 | **+19.20%** | **+21.05%** | +8.39% | — |
 
 > 上表是 2026-11-08 的 `benchmark_results.json`（每种方案第 2 次运行）。
-> 单机短任务方差较大，绝对值会随机器负载变化；统计口径见下。
+> 单机短任务方差较大，绝对值会随机器负载变化；**单次运行、无重复采样，百分比
+> 仅方向性参考**，统计口径见下。
 >
 > **统计口径**：每种方案只有 **1 个进入统计的 measured sample**（第 2 次运行；
 > 第 1 次只用于预热）。表中的百分比是这一次运行相对同批次不加盐的差异，
@@ -112,30 +116,45 @@ flowchart LR
 - 不加盐时 stage-1 shuffle write 只有 **440,303** 条记录（输入 1,000,000 行），
   Spark 的 map-side partial aggregation 已经把热门 key 合并；
 - 全量加盐后 stage-1 的 group 数理论上限是 `20,000 × 10 = 200,000`，实测
-  distinct `(item_id, _salt)` 是 **190,924**，多一次 shuffle，stage-1
-  shuffle write 变成 **598,054** 条；
+  distinct `(item_id, _salt)` 是 **190,924**，在本写法下多一次 shuffle，
+  stage-1 shuffle write 变成 **598,054** 条；
 - 仅热点键加盐只拆 item 9999，stage-1 实际 group 数是 **20,009**，
   stage-1 shuffle write 是 **440,708** 条，接近不加盐；但两阶段仍需
   额外一次 shuffle，所以 wall clock 和最长 Task 仍高于不加盐；
 - 因此在这个**可合并聚合**上，两种加盐方式的净开销都为正，全量加盐更重。
+- 这里的 group 基数膨胀不是独立根因，而是“加盐改变聚合 Key”后的**机制表现**：
+  stage-1 的 key 从 `item_id` 变成 `(item_id, _salt)`，原本可被 Catalyst 合并的
+  同 Key 两阶段聚合被阻断，因此在本写法下多出一次 shuffle；group 数变大是
+  这条链路上的中间结果，不是另一个可以被单独消除的根因。
 
-> **结论**：在当前的 count/sum 简单聚合场景下，由于 Spark 的 Map 端预聚合
-> （Combine）已经非常高效，强行加盐反而增加了网络 IO。本项目保留这一负结果，
-> 说明加盐值得优先验证的场景是复杂 Join 或 groupByKey 长尾倾斜，但**即便在
-> 这些场景，也要实测净收益**，不能默认加盐一定有效。如果聚合本身可以在 map
-> 端合并，应先让 Spark 做 combine。
+> **结论（仅限本实验条件）**：在上述 `local[8]`、16 分区、AQE off、100 万行、
+> 38.04% 热 key 的 `count/sum` 负载上，Spark 的 Map 端预聚合（Combine）已经把
+> 热 key 压小；本实现里的加盐方案额外改写了 stage-1 的聚合 Key，阻断了原本可被
+> Catalyst 合并的同 Key 两阶段聚合，因此在本写法下多出一次 shuffle，净开销为正。
+> 这不等于“加盐天然更差”，也不能外推到生产规模或开启 AQE 的环境。加盐值得优先
+> 验证的场景是复杂 Join 或 groupByKey 长尾倾斜，但**即便在这些场景，也要实测
+> 净收益**，不能默认加盐一定有效。如果聚合本身可以在 map 端合并，应先让 Spark
+> 做 combine。
 >
-> **边界**：这只证明本项目这份 1M 行、38.04% 热 key、`count/sum`、`local[8]`
-> 负载上的结果，不能外推为“加盐对所有可 Combine 负载都是负优化”。反过来，
-> 不可 Combine 也只是加盐可能有效的**必要条件，不是充分条件**；额外 Shuffle、
-> group 膨胀、第二阶段是否仍倾斜，都要用同一套指标验证。
+> 三种方案的对比本身是真实的；但归因边界只到“本实现”：不加盐可能享受 Catalyst
+> 对同 Key 两阶段聚合的合并，加盐方案则不能，两者并不是只差一个布尔位。这个公平性
+> 差异是加盐成本的一部分，不是被隐藏的变量。
+>
+> **边界**：这只证明本项目这份 1M 行、38.04% 热 key、`count/sum`、`local[8]`、
+> 16 分区、AQE off 负载上的结果，不能外推为“加盐对所有可 Combine 负载都是
+> 负优化”，也不能外推到生产规模或开启 AQE 的环境。本实验最长 Task 只有
+> 456ms，长尾并不严重；“仅热点键加盐仍然为负”只适用于这份实现和负载；如果是
+> Join 倾斜或 groupByKey 长尾、单 Task 达到数千万行，加盐仍可能有效，但必须
+> 实测净收益。反过来，不可 Combine 也只是加盐可能有效的**必要条件，不是充分
+> 条件**；额外 Shuffle、group 膨胀、第二阶段是否仍倾斜，都要用同一套指标验证。
 
 **对比口径**：三种方案都写成同样的逻辑两阶段聚合（先部分聚合，再恢复
 `item_id`）。被控制的 treatment 是 **salt scope**，不是“整个物理计划只差一个
-布尔位”：不加盐的两次 `groupBy("item_id")` 可能被 Catalyst 合并成一次 shuffle，
-而任何加盐方案都必须多一次 shuffle，因为 stage-1 的 key 是
-`(item_id, _salt)`，stage-2 才恢复 `item_id`。这次额外 shuffle 属于加盐的
-真实成本，benchmark 不会把它藏起来，而是把 stage 数和 shuffle 字节一并报告。
+布尔位”：不加盐的两次 `groupBy("item_id")` 可能被 Catalyst 合并成一次 shuffle；
+而加盐方案在本写法下会多一次 shuffle，因为 stage-1 的 key 是
+`(item_id, _salt)`，stage-2 才恢复 `item_id`，通常无法享受同 Key 两阶段聚合的
+合并。这次额外 shuffle 属于加盐的真实成本，benchmark 不会把它藏起来，而是把
+stage 数和 shuffle 字节一并报告。
 
 固定 16 个 shuffle partitions，关闭 AQE；用 `collect()` 强制物化，不让
 Catalyst 的 Count 优化跳过阶段；三种方案交错运行两次，取第二次的数据，避免
@@ -443,9 +462,10 @@ DWS 2 条对账：
 - 三种 scope：`none` 不加盐；`all` 所有 item 都加盐；`hot_only` 只给
   `hot_item_id` 加盐，其余 item 的 `_salt=0`。这提供了“全量加盐 vs 只打热点”
   的真实对照，而不是把选择性加盐停留在口头建议。
-- 两阶段：三种方案都写成逻辑两阶段（部分聚合 → 恢复 `item_id`）。加盐方案
-  必然多一次 shuffle，这是被测量的成本，不是被隐藏的变量；报告同时给出
-  stage 数和 shuffle 字节。
+- 两阶段：三种方案都写成逻辑两阶段（部分聚合 → 恢复 `item_id`）。加盐改变了
+  stage-1 的聚合 Key，通常阻断了原本可被 Catalyst 合并的同 Key 两阶段聚合，
+  因此在本写法下多出一次 shuffle；这是被测量的成本，不是被隐藏的变量。报告
+  同时给出 stage 数和 shuffle 字节。
 - benchmark：固定 16 shuffle partitions，关闭 AQE，每种方案运行两次并取第二次
   结果，交错执行 U1/F1/H1/U2/F2/H2；最长 Task 由 JVM `SparkListener` 的
   `TaskInfo.duration()` 采集，只统计 successful task。
@@ -506,6 +526,9 @@ tab 展示三方案对比、stage 明细、实际 group 基数，以及可选的
 - 本项目 1M 行、单向 Shuffle 约 10.6MB，量级远低于本机内存上限；benchmark
   没有采集 Spill 字段，也没有观察到 Spill/OOM。它是机制验证，不是更大数据量
   下 Spill/OOM 事故的复现，不能据此推断生产规模的内存行为。
+- 本实验最长 Task 只有 456ms，长尾并不严重；“加盐为负”不能外推到单 Task
+  数千万行、已经发生 Spill/OOM 的 Join 或 groupByKey 长尾场景。那些场景仍
+  值得做加盐对照，但必须实测净收益。
 - **统计限制**：每种方案只有 1 个进入统计的 measured sample，没有重复采样、
   置信区间或显著性检验；wall clock / 最长 Task 的百分比是方向性证据，不是
   精确效应量。sweep 的 baseline 每个桶独立重跑，且存在跨桶漂移，跨桶百分比

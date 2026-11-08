@@ -72,7 +72,7 @@ DWD read (narrow)
   -> groupBy(item_id) (wide, shuffle #2)
   -> write (wide-ish)
 ```
-加盐版本必然比 baseline 多一次 Shuffle，因为 stage-1 的 key 与 stage-2 不同。这笔开销是否值得，取决于它能否消除长尾。不能盲目认定“加盐就是优化”，必须结合数据分布和聚合是否可合并来评判。
+加盐版本在本写法下通常比 baseline 多一次 Shuffle：stage-1 的 key 变成 `(item_id, _salt)`，原本可被 Catalyst 合并的同 Key 两阶段聚合被阻断。这笔开销是否值得，取决于它能否消除长尾。不能盲目认定“加盐就是优化”，必须结合数据分布和聚合是否可合并来评判。
 
 ---
 
@@ -168,9 +168,11 @@ Stage 1 的 group 数上限约为 `G × N`。热 key 在每个桶预期处理 `H
 - shuffle 记录数增加（部分结果变大）；
 - 多一次 shuffle；
 - 序列化、调度和任务数开销增加；
-- 如果聚合可通过 map-side combine 加速，baseline 已经很快，加盐反而会带来净损失。
+- 如果聚合可通过 map-side combine 加速，baseline 已经很快；在本项目这份负载和实现里，加盐会带来净损失。
 
 本项目 `G=20,000`、`N=10`、`H=380,421`。全量加盐时 stage-1 group 的理论上限是 200,000，实测 190,924；baseline 已 combine 到 440,303 条 stage-1 shuffle 记录，全量加盐后是 598,054 条。2026-11-08 的 measured run 中，全量加盐 wall clock 从 2.354s 升至 3.408s（+44.77%），最长 Task 从 456ms 升至 846ms（+85.53%）；仅热点键加盐 wall clock 为 2.806s（+19.20%），最长 Task 552ms（+21.05%），负担更轻但仍未转为收益。这些数字直接印证了成本模型的推演。
+
+这些数字来自 1M 行、`local[8]` 的小规模实验；不加盐方案最长 Task 只有 456ms，长尾并不严重。因此“本实验里加盐为负”不能外推到单 Task 数千万行、已经发生 Spill/OOM 的 Join 或 groupByKey 长尾场景，也不能外推到开启 AQE 的生产环境。
 
 ### 3.4 什么时候值得优先验证加盐
 - 聚合不可 Combine：如 `collect_list`/`collect_set`、精确去重、复杂 percentile；
@@ -421,7 +423,9 @@ listener 编译失败时，benchmark 仍会记录 wall clock，但 Task 字段�
 
 结论必须带条件：
 
-> 在这份可 map-side combine 的 `count/sum` 负载上，全量加盐和仅热点键加盐都更慢；这不等于加盐在所有场景都无用，也不能外推成“加盐对所有可 Combine 负载都是负优化”。选择性加盐能降低额外开销，但无法消除“多一次 shuffle”的固定成本。
+> 在这份可 map-side combine 的 `count/sum` 负载上，全量加盐和仅热点键加盐都更慢；这不等于加盐在所有场景都无用，也不能外推成“加盐对所有可 Combine 负载都是负优化”。选择性加盐能降低额外开销，但在本写法下仍多一次 shuffle。
+>
+> 三种方案的对比是真实的；但归因边界只到“本实现”：不加盐可能享受 Catalyst 对同 Key 两阶段聚合的合并，加盐方案则不能。这个公平性差异是加盐成本的一部分，不是被隐藏的变量。
 
 反过来也要防止把结论用过头：不可 Combine 只是加盐可能有效的**必要条件，不是充分条件**。本项目没有对不可 Combine 场景做实证，不能拿这份负结果替那些场景背书；迁移到新负载时必须重跑同一套 skew probe 和指标对照。
 
